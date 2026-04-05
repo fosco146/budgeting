@@ -316,11 +316,7 @@ tbody tr:hover { background: var(--surface-2); }
       <button class="btn btn-primary" onclick="openManualEntry()">+ Add</button>
       <button class="btn" onclick="syncToSheets()">↑ Push</button>
       <button class="btn" onclick="pullFromSheets()">↓ Pull</button>
-      <button class="btn" onclick="openCardNames()">🏷 Cards</button>
       <button class="btn" onclick="toggleSetup()">⚙ Setup</button>
-      <button class="btn" onclick="exportJSON()">↓ Export JSON</button>
-      <button class="btn" onclick="document.getElementById('json-import').click()">↑ Import JSON</button>
-      <input type="file" id="json-import" accept=".json" style="display:none" onchange="importJSON(event)">
     </div>
   </header>
 
@@ -469,6 +465,18 @@ function doGet(e) {
       </div>
       <button class="btn" onclick="recategorizeAll()" style="margin-top:8px">↻ Re-categorize All Transactions</button>
     </div>
+
+    <!-- Cards & Data -->
+    <div class="card" style="margin-top:16px">
+      <h3 style="margin-bottom:16px">Cards &amp; Data</h3>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <button class="btn" onclick="openCardNames()">🏷 Manage Cards</button>
+        <button class="btn" onclick="exportJSON()">↓ Export JSON</button>
+        <button class="btn" onclick="document.getElementById('json-import').click()">↑ Import JSON</button>
+        <input type="file" id="json-import" accept=".json" style="display:none" onchange="importJSON(event)">
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--text-muted)">Export/Import JSON as a backup or to migrate data between devices.</div>
+    </div>
   </div>
 
   <!-- Drop Zone -->
@@ -506,14 +514,28 @@ function doGet(e) {
       </div>
     </div>
 
+    <!-- Spend Pulse Panel -->
+    <div class="card" id="pulse-panel" style="margin-bottom:20px">
+      <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="togglePulse()">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:14px;font-weight:600;letter-spacing:-0.2px">Spend Pulse</span>
+          <span id="pulse-badge" style="font-size:11px;padding:2px 8px;border-radius:20px;background:var(--surface-2);color:var(--text-muted);font-weight:500"></span>
+        </div>
+        <span id="pulse-chevron" style="color:var(--text-muted);font-size:12px;transition:transform 0.2s">▼</span>
+      </div>
+      <div id="pulse-body" class="hidden" style="margin-top:20px">
+        <div id="pulse-content"></div>
+      </div>
+    </div>
+
     <!-- Charts -->
     <div class="charts-grid">
       <div class="chart-card">
-        <h3>Monthly Spending</h3>
+        <h3>90-Day Periods</h3>
         <canvas id="chart-monthly"></canvas>
       </div>
       <div class="chart-card">
-        <h3>By Category</h3>
+        <h3>By Category Total</h3>
         <canvas id="chart-category"></canvas>
       </div>
     </div>
@@ -683,6 +705,9 @@ let currentSort = { key: 'date', dir: 'desc' };
 let currentPage = 1;
 const PAGE_SIZE = 50;
 let activeTimeRange = '90'; // default last 90 days
+let activeCustomStart = null; // exact date string for period bar clicks
+let activeCustomEnd = null;
+let pulseOpen = false;
 
 // Charts
 let chartMonthly, chartCategory, chartCatAvg, chartMerchants;
@@ -1334,7 +1359,7 @@ async function syncToSheets() {
   }
 }
 
-async function pullFromSheets() {
+async function pullFromSheets(silent = false) {
   const { scriptUrl, passphrase } = getConfig();
   if (!scriptUrl) { toast('Add your Apps Script URL in Setup first', 'error'); return; }
   if (!passphrase) { toast('Add your passphrase in Setup', 'error'); return; }
@@ -1394,7 +1419,8 @@ async function pullFromSheets() {
     saveLocal();
     setTimeRange('90');
     renderDashboard();
-    toast(`Pulled ${pulled.length} transactions from Sheets`, 'success');
+    if (!silent) toast(`Pulled ${pulled.length} transactions from Sheets`, 'success');
+    else toast('Auto-pulled latest data', 'success');
   } catch(e) {
     toast('Pull failed: ' + e.message.substring(0, 80), 'error');
   }
@@ -1457,14 +1483,19 @@ function renderDashboard() {
     const cutoffStr = cutoff.toISOString().split('T')[0];
     allFiltered = allFiltered.filter(t => t.date >= cutoffStr);
   } else if (activeTimeRange === 'custom') {
-    const from = document.getElementById('filter-from').value;
-    const to = document.getElementById('filter-to').value;
-    if (from) allFiltered = allFiltered.filter(t => t.date >= from);
-    if (to) {
-      const [toYear, toMonth] = to.split('-').map(Number);
-      const lastDay = new Date(toYear, toMonth, 0).getDate();
-      const toEnd = `${to}-${String(lastDay).padStart(2, '0')}`;
-      allFiltered = allFiltered.filter(t => t.date <= toEnd);
+    // Use exact dates if set by period bar click, otherwise fall back to month pickers
+    if (activeCustomStart && activeCustomEnd) {
+      allFiltered = allFiltered.filter(t => t.date >= activeCustomStart && t.date <= activeCustomEnd);
+    } else {
+      const from = document.getElementById('filter-from').value;
+      const to = document.getElementById('filter-to').value;
+      if (from) allFiltered = allFiltered.filter(t => t.date >= from);
+      if (to) {
+        const [toYear, toMonth] = to.split('-').map(Number);
+        const lastDay = new Date(toYear, toMonth, 0).getDate();
+        const toEnd = `${to}-${String(lastDay).padStart(2, '0')}`;
+        allFiltered = allFiltered.filter(t => t.date <= toEnd);
+      }
     }
   }
 
@@ -1516,6 +1547,7 @@ function renderDashboard() {
   populateFilters();
   renderCharts(charges, monthCount);
   renderTable();
+  renderPulse();
 }
 
 let _filterSnapshot = { cards: '', cats: '' };
@@ -1563,13 +1595,16 @@ function getFilteredTransactions() {
     const cutoffStr = cutoff.toISOString().split('T')[0];
     filtered = filtered.filter(t => t.date >= cutoffStr);
   } else {
-    if (from) filtered = filtered.filter(t => t.date >= from);
-    if (to) {
-      // Compute the actual last day of the selected month instead of blindly appending '-31'
-      const [toYear, toMonth] = to.split('-').map(Number);
-      const lastDay = new Date(toYear, toMonth, 0).getDate(); // day 0 of next month = last day of this month
-      const toEnd = `${to}-${String(lastDay).padStart(2, '0')}`;
-      filtered = filtered.filter(t => t.date <= toEnd);
+    if (activeCustomStart && activeCustomEnd && activeTimeRange === 'custom') {
+      filtered = filtered.filter(t => t.date >= activeCustomStart && t.date <= activeCustomEnd);
+    } else {
+      if (from) filtered = filtered.filter(t => t.date >= from);
+      if (to) {
+        const [toYear, toMonth] = to.split('-').map(Number);
+        const lastDay = new Date(toYear, toMonth, 0).getDate();
+        const toEnd = `${to}-${String(lastDay).padStart(2, '0')}`;
+        filtered = filtered.filter(t => t.date <= toEnd);
+      }
     }
   }
   
@@ -1644,6 +1679,8 @@ function clearFilters() {
 
 function setTimeRange(range) {
   activeTimeRange = range;
+  activeCustomStart = null;
+  activeCustomEnd = null;
   // Hide custom tab whenever a preset is selected
   const customBtn = document.getElementById('custom-range-btn');
   if (customBtn) customBtn.classList.add('hidden');
@@ -1664,6 +1701,8 @@ function setTimeRange(range) {
 
 function setCustomRange() {
   // Called when user manually changes a month picker — switch to custom mode
+  activeCustomStart = null; // clear exact dates, use month pickers
+  activeCustomEnd = null;
   activeTimeRange = 'custom';
   const customBtn = document.getElementById('custom-range-btn');
   if (customBtn) {
@@ -1711,48 +1750,102 @@ function renameCard(oldKey, newName) {
 // CHARTS
 // ============================================
 function renderCharts(charges, monthCount) {
-  // Monthly spending
-  const monthly = {};
-  charges.forEach(t => {
-    const m = t.date.substring(0, 7);
-    monthly[m] = roundCents((monthly[m] || 0) + t.amount);
-  });
-  const monthKeys = Object.keys(monthly).sort();
+  // 90-day period chart — always built from ALL transactions (not filtered window)
+  // so the chart shows full rolling context regardless of active filter
+  const allCharges = transactions.filter(t => t.category !== 'Income/Credit');
 
-  // By card per month for stacked
-  const cards = [...new Set(charges.map(t => t.card))];
-  const cardMonthly = {};
-  cards.forEach(c => { cardMonthly[c] = {}; });
-  charges.forEach(t => {
-    const m = t.date.substring(0, 7);
-    cardMonthly[t.card][m] = roundCents((cardMonthly[t.card][m] || 0) + t.amount);
-  });
-
-  const cardColors = ['#38bdf8', '#f472b6', '#fbbf24', '#34d399', '#a78bfa', '#fb923c'];
-
-  if (chartMonthly) chartMonthly.destroy();
-  chartMonthly = new Chart(document.getElementById('chart-monthly'), {
-    type: 'bar',
-    data: {
-      labels: monthKeys,
-      datasets: cards.map((c, i) => ({
-        label: c,
-        data: monthKeys.map(m => parseFloat((cardMonthly[c][m] || 0).toFixed(2))),
-        backgroundColor: cardColors[i % cardColors.length] + '99',
-        borderColor: cardColors[i % cardColors.length],
-        borderWidth: 1,
-        borderRadius: 4,
-      }))
-    },
-    options: {
-      responsive: true,
-      plugins: { legend: { labels: { color: '#94a3b8', font: { family: 'DM Sans' } } } },
-      scales: {
-        x: { stacked: true, ticks: { color: '#64748b', font: { family: 'DM Sans', size: 11 } }, grid: { color: '#1e2a3e' } },
-        y: { stacked: true, ticks: { color: '#64748b', callback: v => '$' + v.toLocaleString(), font: { family: 'JetBrains Mono', size: 11 } }, grid: { color: '#1e2a3e' } }
-      }
+  // Find earliest and latest dates across all data
+  const allDates = allCharges.map(t => t.date).filter(Boolean).sort();
+  if (allDates.length === 0) {
+    if (chartMonthly) { chartMonthly.destroy(); chartMonthly = null; }
+  } else {
+    // Build 90-day buckets going backwards from today
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    const periods = [];
+    // Generate up to 5 periods (covers ~15 months for year-over-year context)
+    for (let i = 0; i < 5; i++) {
+      const end = new Date(today);
+      end.setDate(end.getDate() - i * 90);
+      const start = new Date(end);
+      start.setDate(start.getDate() - 89);
+      const startStr = start.toISOString().split('T')[0];
+      const endStr = end.toISOString().split('T')[0];
+      const startMon = start.toLocaleDateString('en-US', { month: 'short' });
+      const endMon = end.toLocaleDateString('en-US', { month: 'short' });
+      const yr = "'" + String(end.getFullYear()).slice(2);
+      const label = startMon + '–' + endMon + ' ' + yr;
+      periods.unshift({ startStr, endStr, label, isCurrent: i === 0 });
     }
-  });
+
+    // Filter to periods that actually have data
+    const periodsWithData = periods.filter(p =>
+      allCharges.some(t => t.date >= p.startStr && t.date <= p.endStr)
+    );
+
+    const cards = [...new Set(allCharges.map(t => t.card))];
+    const cardColors = ['#38bdf8', '#f472b6', '#fbbf24', '#34d399', '#a78bfa', '#fb923c'];
+
+    if (chartMonthly) chartMonthly.destroy();
+    chartMonthly = new Chart(document.getElementById('chart-monthly'), {
+      type: 'bar',
+      data: {
+        labels: periodsWithData.map(p => p.label),
+        datasets: cards.map((c, i) => ({
+          label: c,
+          data: periodsWithData.map(p => {
+            const total = allCharges
+              .filter(t => t.card === c && t.date >= p.startStr && t.date <= p.endStr)
+              .reduce((s, t) => s + t.amount, 0);
+            return parseFloat(roundCents(total).toFixed(2));
+          }),
+          backgroundColor: cardColors[i % cardColors.length] + '99',
+          borderColor: cardColors[i % cardColors.length],
+          borderWidth: 1,
+          borderRadius: 4,
+        }))
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { labels: { color: '#94a3b8', font: { family: 'DM Sans' } } },
+          tooltip: {
+            callbacks: {
+              footer: (items) => {
+                const total = items.reduce((s, i) => s + i.raw, 0);
+                return 'Total: $' + roundCents(total).toLocaleString(undefined, {minimumFractionDigits:2});
+              }
+            }
+          }
+        },
+        scales: {
+          x: { stacked: true, ticks: { color: '#64748b', font: { family: 'DM Sans', size: 10 } }, grid: { color: '#1e2a3e' } },
+          y: { stacked: true, ticks: { color: '#64748b', callback: v => '$' + v.toLocaleString(), font: { family: 'JetBrains Mono', size: 11 } }, grid: { color: '#1e2a3e' } }
+        },
+        onClick: (evt, elements) => {
+          if (!elements.length) return;
+          const idx = elements[0].index;
+          const p = periodsWithData[idx];
+          if (!p) return;
+          // Snap dashboard to exact 90-day window using precise date strings
+          activeTimeRange = 'custom';
+          activeCustomStart = p.startStr;
+          activeCustomEnd = p.endStr;
+          const customBtn = document.getElementById('custom-range-btn');
+          if (customBtn) customBtn.classList.remove('hidden');
+          document.querySelectorAll('.time-btn').forEach(b => b.classList.toggle('active', b.dataset.range === 'custom'));
+          // Set month pickers to approximate range (display only)
+          document.getElementById('filter-from').value = p.startStr.substring(0, 7);
+          document.getElementById('filter-to').value = p.endStr.substring(0, 7);
+          currentPage = 1;
+          renderDashboard();
+          toast('Viewing ' + p.label, 'success');
+          document.getElementById('dashboard').scrollIntoView({ behavior: 'smooth' });
+        },
+        onHover: (evt) => { evt.native.target.style.cursor = 'pointer'; }
+      }
+    });
+  }
 
   // Category breakdown — horizontal bar with amounts visible
   const catTotals = {};
@@ -1789,7 +1882,26 @@ function renderCharts(charges, monthCount) {
       scales: {
         x: { ticks: { color: '#64748b', callback: v => '$' + v.toLocaleString(), font: { family: 'JetBrains Mono', size: 11 } }, grid: { color: '#1e2a3e' } },
         y: { ticks: { color: '#94a3b8', font: { family: 'DM Sans', size: 12 }, autoSkip: false, padding: 4 }, grid: { display: false }, afterFit: (axis) => { axis.width = Math.max(axis.width, 180); } }
-      }
+      },
+      onClick: (evt, elements) => {
+        if (!elements.length) return;
+        const idx = elements[0].index;
+        const rawLabel = catEntries[idx][0];
+        const catSel = document.getElementById('filter-category');
+        if (catSel.value === rawLabel) {
+          catSel.value = '';
+          currentSort = { key: 'date', dir: 'desc' };
+          toast('Filter cleared', 'success');
+        } else {
+          catSel.value = rawLabel;
+          currentSort = { key: 'amount', dir: 'desc' };
+          toast('Filtered to: ' + rawLabel, 'success');
+        }
+        currentPage = 1;
+        renderDashboard();
+        document.querySelector('.card .table-wrap')?.closest('.card')?.scrollIntoView({ behavior: 'smooth' });
+      },
+      onHover: (evt) => { evt.native.target.style.cursor = 'pointer'; }
     },
     plugins: [{
       id: 'barValueLabels',
@@ -1885,7 +1997,25 @@ function renderCharts(charges, monthCount) {
       indexAxis: 'y',
       responsive: true,
       layout: { padding: { left: 10 } },
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+      },
+      onClick: (evt, elements) => {
+        if (!elements.length) return;
+        const merchant = topMerchants[elements[0].index][0];
+        const searchEl = document.getElementById('filter-search');
+        if (searchEl.value === merchant) {
+          searchEl.value = '';
+          toast('Search cleared', 'success');
+        } else {
+          searchEl.value = merchant;
+          toast('Filtered to: ' + merchant, 'success');
+        }
+        currentPage = 1;
+        renderDashboard();
+        document.querySelector('.card .table-wrap')?.closest('.card')?.scrollIntoView({ behavior: 'smooth' });
+      },
+      onHover: (evt) => { evt.native.target.style.cursor = 'pointer'; },
       scales: {
         x: { ticks: { color: '#64748b', callback: v => '$' + v.toLocaleString(), font: { family: 'JetBrains Mono', size: 11 } }, grid: { color: '#1e2a3e' } },
         y: { ticks: { color: '#94a3b8', font: { family: 'DM Sans', size: 11 }, autoSkip: false, padding: 4 }, grid: { display: false }, afterFit: (axis) => { axis.width = Math.max(axis.width, 160); } }
@@ -2350,34 +2480,259 @@ initCustomCategories();
 setTimeRange('90');
 if (transactions.length > 0) renderDashboard();
 
-// Auto-connect on load (NO auto-pull — user must click Pull)
+// Auto-connect and auto-pull on load
 const cfg = getConfig();
 if (cfg.scriptUrl) {
-  // Validate it looks like a Google Apps Script URL before sending a network request
   let urlOk = false;
   try { const u = new URL(cfg.scriptUrl); urlOk = u.protocol === 'https:'; } catch(e) {}
   if (urlOk) {
+    document.getElementById('sheets-status').textContent = '● Connecting...';
+    // First do a connection test
     fetch(cfg.scriptUrl, { signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined })
       .then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.text();
       })
       .then(text => {
-        // Guard: only parse if response looks like JSON (starts with '{')
-        if (!text.trimStart().startsWith('{')) return;
-        try {
-          const data = JSON.parse(text);
-          if (data.status === 'ok') {
-            document.getElementById('sheets-status').className = 'status-connected';
-            document.getElementById('sheets-status').textContent = '● Connected';
-            if (transactions.length === 0) {
-              toast('Connected — click ↓ Pull to load your data', 'success');
-            }
-          }
-        } catch(e) {}
-      }).catch(() => {});
+        if (!text.trimStart().startsWith('{')) throw new Error('Unexpected response');
+        const data = JSON.parse(text);
+        if (data.status !== 'ok') throw new Error('Connection test failed');
+        // Connected — now auto-pull
+        document.getElementById('sheets-status').className = 'status-connected';
+        document.getElementById('sheets-status').textContent = '● Connected';
+        return pullFromSheets(true); // pass silent=true so it doesn't double-toast
+      })
+      .catch(err => {
+        document.getElementById('sheets-status').className = 'status-disconnected';
+        document.getElementById('sheets-status').textContent = '● Not connected';
+        toast('Auto-pull failed: ' + (err.message || 'Could not reach server'), 'error');
+      });
   }
 }
+
+// ============================================
+// SPEND PULSE
+// ============================================
+function togglePulse() {
+  pulseOpen = !pulseOpen;
+  document.getElementById('pulse-body').classList.toggle('hidden', !pulseOpen);
+  document.getElementById('pulse-chevron').style.transform = pulseOpen ? 'rotate(180deg)' : '';
+  if (pulseOpen) renderPulseContent();
+}
+
+function renderPulse() {
+  // Compute badge: how many categories are elevated vs baseline
+  const result = computePulseData();
+  if (!result) {
+    document.getElementById('pulse-badge').textContent = 'not enough data';
+    return;
+  }
+  const elevated = result.filter(r => r.pctDelta > 25 && r.baselineMonthly > 0).length;
+  const badge = document.getElementById('pulse-badge');
+  if (elevated === 0) {
+    badge.textContent = '✓ spend on track';
+    badge.style.background = 'rgba(52,211,153,0.15)';
+    badge.style.color = 'var(--green)';
+  } else {
+    badge.textContent = `${elevated} categor${elevated === 1 ? 'y' : 'ies'} elevated`;
+    badge.style.background = 'rgba(251,191,36,0.15)';
+    badge.style.color = 'var(--amber)';
+  }
+  if (pulseOpen) renderPulseContent();
+}
+
+function computePulseData() {
+  // Current window: last 90 days
+  const now = new Date();
+  const cutoff90 = new Date(now);
+  cutoff90.setDate(cutoff90.getDate() - 90);
+  const cutoffStr = cutoff90.toISOString().split('T')[0];
+
+  const currentTx = transactions.filter(t =>
+    t.category !== 'Income/Credit' && t.date >= cutoffStr
+  );
+
+  // Baseline: everything BEFORE the current 90-day window, excluding Income/Credit
+  const baselineTx = transactions.filter(t =>
+    t.category !== 'Income/Credit' && t.date < cutoffStr
+  );
+
+  if (baselineTx.length < 10) return null; // not enough history
+
+  // Get date range of baseline to compute monthly avg
+  const baselineDates = baselineTx.map(t => t.date).sort();
+  const baselineStart = new Date(baselineDates[0]);
+  const baselineEnd = new Date(baselineDates[baselineDates.length - 1]);
+  const baselineDays = Math.max(1, (baselineEnd - baselineStart) / (1000 * 60 * 60 * 24));
+  const baselineMonths = Math.max(1, baselineDays / 30.44);
+
+  // Aggregate by category
+  const currentByCat = {};
+  currentTx.forEach(t => {
+    currentByCat[t.category] = roundCents((currentByCat[t.category] || 0) + t.amount);
+  });
+
+  const baselineByCat = {};
+  baselineTx.forEach(t => {
+    baselineByCat[t.category] = roundCents((baselineByCat[t.category] || 0) + t.amount);
+  });
+
+  // Build comparison rows for all categories that appear in either window
+  const allCats = [...new Set([...Object.keys(currentByCat), ...Object.keys(baselineByCat)])];
+
+  const rows = allCats.map(cat => {
+    const currentMonthly = roundCents((currentByCat[cat] || 0) / 3); // 90 days = 3 months
+    const baselineMonthly = roundCents((baselineByCat[cat] || 0) / baselineMonths);
+    const delta = roundCents(currentMonthly - baselineMonthly);
+    const pctDelta = baselineMonthly > 0
+      ? Math.round((delta / baselineMonthly) * 100)
+      : (currentMonthly > 0 ? 100 : 0);
+    return { cat, currentMonthly, baselineMonthly, delta, pctDelta };
+  });
+
+  // Sort: elevated first (by absolute delta desc), then on-track, then under
+  rows.sort((a, b) => {
+    const aElev = a.pctDelta > 15;
+    const bElev = b.pctDelta > 15;
+    if (aElev && !bElev) return -1;
+    if (!aElev && bElev) return 1;
+    return Math.abs(b.delta) - Math.abs(a.delta);
+  });
+
+  return rows;
+}
+
+function renderPulseContent() {
+  const el = document.getElementById('pulse-content');
+  const rows = computePulseData();
+
+  if (!rows) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:13px">Not enough historical data to compute a baseline. Load more than 90 days of transactions.</div>';
+    return;
+  }
+
+  const now = new Date();
+  const cutoff90 = new Date(now); cutoff90.setDate(cutoff90.getDate() - 90);
+  const fmtDate = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const periodLabel = `${fmtDate(cutoff90)} – ${fmtDate(now)}`;
+
+  // Filter out categories with no baseline, sort by current monthly spend descending
+  const filtered = rows
+    .filter(r => r.baselineMonthly > 0 && r.currentMonthly >= 1)
+    .sort((a, b) => b.currentMonthly - a.currentMonthly);
+
+  if (filtered.length === 0) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:13px">No comparable categories found.</div>';
+    return;
+  }
+
+  const maxMonthly = Math.max(...filtered.map(r => r.currentMonthly));
+
+  let html = `
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">
+      Monthly avg · current 90 days vs. prior baseline · ${periodLabel}
+    </div>
+    <div style="display:flex;flex-direction:column;gap:2px">
+  `;
+
+  filtered.forEach(r => {
+    const color = CATEGORY_COLORS[r.cat] || '#64748b';
+    const barPct = maxMonthly > 0 ? (r.currentMonthly / maxMonthly) * 100 : 0;
+    const isElevated = r.pctDelta > 25;
+    const isLow = r.pctDelta < -25;
+
+    let deltaLabel, deltaColor;
+    if (isElevated) {
+      deltaLabel = `▲ +${r.pctDelta}%`;
+      deltaColor = 'var(--amber)';
+    } else if (isLow) {
+      deltaLabel = `▼ ${r.pctDelta}%`;
+      deltaColor = 'var(--green)';
+    } else {
+      deltaLabel = '≈ normal';
+      deltaColor = 'var(--text-muted)';
+    }
+
+    const safeId = r.cat.replace(/[^a-zA-Z0-9]/g, '_');
+
+    html += `
+      <div style="border-radius:8px;overflow:hidden">
+        <div class="pulse-row" data-cat="${escapeHtml(r.cat)}"
+          onclick="togglePulseDetail('${escapeHtml(r.cat)}')"
+          style="display:grid;grid-template-columns:130px 1fr 90px 70px;align-items:center;gap:12px;padding:10px 12px;cursor:pointer;border-radius:8px;transition:background 0.15s"
+          onmouseenter="this.style.background='var(--surface-2)'"
+          onmouseleave="this.style.background='transparent'">
+          <div style="display:flex;align-items:center;gap:8px;min-width:0">
+            <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${color};flex-shrink:0"></span>
+            <span style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.cat)}</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="flex:1;height:6px;background:var(--surface-2);border-radius:3px;overflow:hidden">
+              <div style="height:100%;width:${barPct.toFixed(1)}%;background:${color};border-radius:3px;transition:width 0.4s ease"></div>
+            </div>
+          </div>
+          <div style="font-family:var(--mono);font-size:12px;text-align:right;white-space:nowrap">
+            ${formatMoney(r.currentMonthly)}<span style="color:var(--text-muted);font-size:11px">/mo</span>
+          </div>
+          <div style="font-size:11px;font-weight:600;text-align:right;color:${deltaColor};white-space:nowrap">
+            ${deltaLabel}
+          </div>
+        </div>
+        <div id="pulse-detail-${safeId}" class="hidden"
+          style="margin:0 12px 8px;padding:10px;background:var(--bg);border-radius:8px;border:1px solid var(--border)">
+        </div>
+      </div>
+    `;
+  });
+
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function togglePulseDetail(cat) {
+  const safeId = cat.replace(/[^a-zA-Z0-9]/g, '_');
+  const el = document.getElementById('pulse-detail-' + safeId);
+  if (!el) return;
+
+  const isHidden = el.classList.contains('hidden');
+  // Close all others first
+  document.querySelectorAll('[id^="pulse-detail-"]').forEach(d => d.classList.add('hidden'));
+  if (!isHidden) return; // was open, just close it
+
+  el.classList.remove('hidden');
+
+  // Get transactions for this category in the current 90-day window
+  const now = new Date();
+  const cutoff90 = new Date(now);
+  cutoff90.setDate(cutoff90.getDate() - 90);
+  const cutoffStr = cutoff90.toISOString().split('T')[0];
+
+  const catTx = transactions
+    .filter(t => t.category === cat && t.date >= cutoffStr)
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  if (catTx.length === 0) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:12px">No transactions in this window.</div>';
+    return;
+  }
+
+  const color = CATEGORY_COLORS[cat] || '#64748b';
+  const total = sumAmounts(catTx.map(t => t.amount));
+
+  el.innerHTML = `
+    <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">${catTx.length} transactions · ${formatMoney(total)} total in window</div>
+    <div style="display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto">
+      ${catTx.map(t => `
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)">
+          <span style="color:var(--text-muted);font-family:var(--mono);min-width:72px">${formatDateDisplay(t.date)}</span>
+          <span style="flex:1;padding:0 10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.description)}</span>
+          <span style="font-family:var(--mono);font-weight:500;color:${color}">${formatMoney(t.amount)}</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
 </script>
 </body>
 </html>
