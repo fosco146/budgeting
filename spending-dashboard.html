@@ -537,6 +537,7 @@ function doGet(e) {
         <button class="btn btn-sm time-btn" data-range="180" onclick="setTimeRange('180')">6 months</button>
         <button class="btn btn-sm time-btn" data-range="365" onclick="setTimeRange('365')">1 year</button>
         <button class="btn btn-sm time-btn" data-range="all" onclick="setTimeRange('all')">All time</button>
+        <button class="btn btn-sm time-btn hidden" data-range="custom" id="custom-range-btn">Custom</button>
       </div>
       <div class="filters">
         <select id="filter-card" onchange="renderDashboard()">
@@ -545,9 +546,9 @@ function doGet(e) {
         <select id="filter-category" onchange="renderDashboard()">
           <option value="">All Categories</option>
         </select>
-        <input type="month" id="filter-from" onchange="renderDashboard()">
+        <input type="month" id="filter-from" onchange="setCustomRange()">
         <span style="color:var(--text-muted)">to</span>
-        <input type="month" id="filter-to" onchange="renderDashboard()">
+        <input type="month" id="filter-to" onchange="setCustomRange()">
         <input type="text" id="filter-search" placeholder="Search descriptions..." oninput="renderDashboard()" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-family:var(--font);font-size:13px;flex:1;min-width:160px;">
         <button class="btn btn-sm" onclick="clearFilters()">Clear</button>
       </div>
@@ -618,6 +619,21 @@ function doGet(e) {
   </div>
 </div>
 
+<!-- New Card Name Modal (replaces prompt()) -->
+<div class="modal-overlay hidden" id="new-card-modal" onclick="if(event.target===this)document.getElementById('new-card-modal').classList.add('hidden')">
+  <div class="modal">
+    <h3>New Card Name</h3>
+    <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px">Enter a name for this card.</p>
+    <label>Card Name</label>
+    <input type="text" id="new-card-name-input" placeholder="e.g. My Visa, Work Amex"
+      onkeydown="if(event.key==='Enter')confirmNewCardName()">
+    <div class="modal-actions">
+      <button class="btn" onclick="document.getElementById('new-card-modal').classList.add('hidden')">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmNewCardName()">Add Card</button>
+    </div>
+  </div>
+</div>
+
 <!-- Card Names Manager (in settings) -->
 <div class="modal-overlay hidden" id="cardnames-modal" onclick="if(event.target===this)document.getElementById('cardnames-modal').classList.add('hidden')">
   <div class="modal">
@@ -666,7 +682,7 @@ let editingIdx = null;
 let currentSort = { key: 'date', dir: 'desc' };
 let currentPage = 1;
 const PAGE_SIZE = 50;
-let activeTimeRange = '30'; // default last 30 days
+let activeTimeRange = '90'; // default last 90 days
 
 // Charts
 let chartMonthly, chartCategory, chartCatAvg, chartMerchants;
@@ -859,20 +875,31 @@ function detectIssuerAndMap(headers, rows, filename) {
 function parseDate(str) {
   if (!str) return null;
   str = str.replace(/['"]/g, '').trim();
-  // Try MM/DD/YYYY or MM/DD/YY
+  // Try MM/DD/YYYY or MM/DD/YY or MM-DD-YYYY
   let m = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
   if (m) {
     let yr = parseInt(m[3]);
     if (yr < 100) yr += 2000;
-    const d = new Date(yr, parseInt(m[1])-1, parseInt(m[2]));
-    if (!isNaN(d)) return d.toISOString().split('T')[0];
+    const mo = parseInt(m[1]);
+    const dy = parseInt(m[2]);
+    // Validate ranges
+    if (mo < 1 || mo > 12 || dy < 1 || dy > 31) return null;
+    return `${yr}-${String(mo).padStart(2,'0')}-${String(dy).padStart(2,'0')}`;
   }
   // Try YYYY-MM-DD
   m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (m) return str;
-  // Fallback
+  if (m) {
+    const [, yr, mo, dy] = m.map(Number);
+    if (mo < 1 || mo > 12 || dy < 1 || dy > 31) return null;
+    return str;
+  }
+  // Fallback: use Date() but re-emit as local YYYY-MM-DD to avoid UTC shift
   const d = new Date(str);
-  if (!isNaN(d)) return d.toISOString().split('T')[0];
+  if (!isNaN(d)) {
+    // Adjust for timezone offset so "2024-01-15" doesn't become "2024-01-14"
+    const local = new Date(d.getTime() + d.getTimezoneOffset() * 60000);
+    return local.toISOString().split('T')[0];
+  }
   return null;
 }
 
@@ -1230,13 +1257,25 @@ function getConfig() {
 }
 function saveConfig() {
   const cfg = getConfig();
-  localStorage.setItem('spend_tracker_config', JSON.stringify(cfg));
+  // Obfuscate passphrase in storage (not encryption, but avoids plaintext exposure)
+  const storable = {
+    scriptUrl: cfg.scriptUrl,
+    _p: cfg.passphrase ? btoa(unescape(encodeURIComponent(cfg.passphrase))) : ''
+  };
+  localStorage.setItem('spend_tracker_config', JSON.stringify(storable));
 }
 function loadConfig() {
   try {
     const cfg = JSON.parse(localStorage.getItem('spend_tracker_config') || '{}');
     if (cfg.scriptUrl) document.getElementById('script-url').value = cfg.scriptUrl;
-    if (cfg.passphrase) document.getElementById('passphrase').value = cfg.passphrase;
+    // Support both old plaintext passphrase and new obfuscated form
+    if (cfg._p) {
+      try {
+        document.getElementById('passphrase').value = decodeURIComponent(escape(atob(cfg._p)));
+      } catch(e) {}
+    } else if (cfg.passphrase) {
+      document.getElementById('passphrase').value = cfg.passphrase;
+    }
   } catch(e) {}
 }
 
@@ -1329,7 +1368,7 @@ async function pullFromSheets() {
         description: r[1] || '',
         category: r[2] || 'Other',
         card: r[3] || 'Unknown',
-        amount: parseFloat(r[4]) || 0,
+        amount: roundCents(parseFloat(r[4]) || 0),
         id: r[5] || `pulled_${i}_${Math.random().toString(36).substr(2,4)}`
       });
     }
@@ -1353,7 +1392,7 @@ async function pullFromSheets() {
     }
     
     saveLocal();
-    setTimeRange('30');
+    setTimeRange('90');
     renderDashboard();
     toast(`Pulled ${pulled.length} transactions from Sheets`, 'success');
   } catch(e) {
@@ -1386,6 +1425,7 @@ function importJSON(event) {
         if (data.cardNames) cardNames = data.cardNames;
         if (data.customCategories) { customCategories = data.customCategories; initCustomCategories(); saveCustomCategories(); }
         saveLocal();
+        setTimeRange('90');
         renderDashboard();
         toast(`Imported ${transactions.length} transactions`, 'success');
       }
@@ -1407,31 +1447,48 @@ function renderDashboard() {
   }
   document.getElementById('dashboard').classList.remove('hidden');
 
-  // Apply ALL filters for stats and charts (same as table)
-  let charges = transactions.filter(t => t.category !== 'Income/Credit');
-  
+  // Apply ALL filters first (same base as table), then exclude Income/Credit for spend stats/charts
+  let allFiltered = [...transactions];
+
   // Time range
-  if (activeTimeRange !== 'all') {
+  if (activeTimeRange !== 'all' && activeTimeRange !== 'custom') {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - parseInt(activeTimeRange));
     const cutoffStr = cutoff.toISOString().split('T')[0];
-    charges = charges.filter(t => t.date >= cutoffStr);
+    allFiltered = allFiltered.filter(t => t.date >= cutoffStr);
+  } else if (activeTimeRange === 'custom') {
+    const from = document.getElementById('filter-from').value;
+    const to = document.getElementById('filter-to').value;
+    if (from) allFiltered = allFiltered.filter(t => t.date >= from);
+    if (to) {
+      const [toYear, toMonth] = to.split('-').map(Number);
+      const lastDay = new Date(toYear, toMonth, 0).getDate();
+      const toEnd = `${to}-${String(lastDay).padStart(2, '0')}`;
+      allFiltered = allFiltered.filter(t => t.date <= toEnd);
+    }
   }
 
-  // Card and category filters
+  // Card, category, and search filters
   const cardFilter = document.getElementById('filter-card').value;
   const catFilter = document.getElementById('filter-category').value;
   const searchFilter = document.getElementById('filter-search').value.toLowerCase();
-  if (cardFilter) charges = charges.filter(t => t.card === cardFilter);
-  if (catFilter) charges = charges.filter(t => t.category === catFilter);
-  if (searchFilter) charges = charges.filter(t => t.description.toLowerCase().includes(searchFilter));
+  if (cardFilter) allFiltered = allFiltered.filter(t => t.card === cardFilter);
+  if (catFilter) allFiltered = allFiltered.filter(t => t.category === catFilter);
+  if (searchFilter) allFiltered = allFiltered.filter(t => t.description.toLowerCase().includes(searchFilter));
 
-  const total = charges.reduce((s, t) => s + t.amount, 0);
+  // Charges = spend-only (no credits) for stats and charts
+  let charges = allFiltered.filter(t => t.category !== 'Income/Credit');
 
-  // Calculate months spanned by actual date range (not distinct calendar months)
+  const total = sumAmounts(charges.map(t => t.amount));
+
+  // Calculate months spanned.
+  // When a fixed time-range button is active (30/60/90/180), use that window
+  // so avg/month isn't inflated when actual transaction dates cluster in a short span.
   const dates = charges.map(t => t.date).filter(Boolean).sort();
   let monthCount = 1;
-  if (dates.length >= 2) {
+  if (activeTimeRange !== 'all' && activeTimeRange !== 'custom') {
+    monthCount = Math.max(1, parseInt(activeTimeRange) / 30.44);
+  } else if (dates.length >= 2) {
     const first = new Date(dates[0]);
     const last = new Date(dates[dates.length - 1]);
     const daySpan = (last - first) / (1000 * 60 * 60 * 24);
@@ -1448,7 +1505,7 @@ function renderDashboard() {
 
   // Top category
   const catTotals = {};
-  charges.forEach(t => { catTotals[t.category] = (catTotals[t.category] || 0) + t.amount; });
+  charges.forEach(t => { catTotals[t.category] = roundCents((catTotals[t.category] || 0) + t.amount); });
   const topCat = Object.entries(catTotals).sort((a,b) => b[1] - a[1])[0];
   if (topCat) {
     document.getElementById('stat-top-cat').textContent = topCat[0];
@@ -1461,20 +1518,31 @@ function renderDashboard() {
   renderTable();
 }
 
+let _filterSnapshot = { cards: '', cats: '' };
 function populateFilters() {
   const cards = [...new Set(transactions.map(t => t.card))].sort();
-  const cats = [...new Set(transactions.map(t => t.category))].sort();
-  
+  const cats  = [...new Set(transactions.map(t => t.category))].sort();
+  const cardsKey = cards.join('|');
+  const catsKey  = cats.join('|');
+
   const cardSel = document.getElementById('filter-card');
-  const catSel = document.getElementById('filter-category');
+  const catSel  = document.getElementById('filter-category');
   const cardVal = cardSel.value;
-  const catVal = catSel.value;
-  
-  cardSel.innerHTML = '<option value="">All Cards</option>' + cards.map(c => `<option value="${c}">${c}</option>`).join('');
-  catSel.innerHTML = '<option value="">All Categories</option>' + cats.map(c => `<option value="${c}">${c}</option>`).join('');
-  
+  const catVal  = catSel.value;
+
+  if (cardsKey !== _filterSnapshot.cards) {
+    cardSel.innerHTML = '<option value="">All Cards</option>'
+      + cards.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    _filterSnapshot.cards = cardsKey;
+  }
+  if (catsKey !== _filterSnapshot.cats) {
+    catSel.innerHTML = '<option value="">All Categories</option>'
+      + cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    _filterSnapshot.cats = catsKey;
+  }
+
   cardSel.value = cardVal;
-  catSel.value = catVal;
+  catSel.value  = catVal;
 }
 
 function getFilteredTransactions() {
@@ -1489,14 +1557,20 @@ function getFilteredTransactions() {
   if (cat) filtered = filtered.filter(t => t.category === cat);
   
   // Apply time range precisely if active (overrides month pickers)
-  if (activeTimeRange !== 'all') {
+  if (activeTimeRange !== 'all' && activeTimeRange !== 'custom') {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - parseInt(activeTimeRange));
     const cutoffStr = cutoff.toISOString().split('T')[0];
     filtered = filtered.filter(t => t.date >= cutoffStr);
   } else {
     if (from) filtered = filtered.filter(t => t.date >= from);
-    if (to) filtered = filtered.filter(t => t.date <= to + '-31');
+    if (to) {
+      // Compute the actual last day of the selected month instead of blindly appending '-31'
+      const [toYear, toMonth] = to.split('-').map(Number);
+      const lastDay = new Date(toYear, toMonth, 0).getDate(); // day 0 of next month = last day of this month
+      const toEnd = `${to}-${String(lastDay).padStart(2, '0')}`;
+      filtered = filtered.filter(t => t.date <= toEnd);
+    }
   }
   
   if (search) filtered = filtered.filter(t => t.description.toLowerCase().includes(search));
@@ -1520,14 +1594,19 @@ function renderTable() {
   const start = (currentPage - 1) * PAGE_SIZE;
   const page = filtered.slice(start, start + PAGE_SIZE);
 
+  // Build an O(1) id→index map so we don't do a linear scan per row
+  const idxById = {};
+  transactions.forEach((t, i) => { idxById[t.id] = i; });
+
   const tbody = document.getElementById('tx-body');
-  tbody.innerHTML = page.map((t, i) => {
-    const realIdx = transactions.indexOf(t);
+  tbody.innerHTML = page.map((t) => {
+    const realIdx = idxById[t.id] ?? transactions.indexOf(t); // fallback for missing ids
+    const color = CATEGORY_COLORS[t.category] || 'var(--accent)';
     return `<tr>
       <td style="font-family:var(--mono);font-size:12px">${formatDateDisplay(t.date)}</td>
       <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(t.description)}</td>
-      <td><span class="category-badge" style="background:${CATEGORY_COLORS[t.category] || 'var(--accent)'}22;color:${CATEGORY_COLORS[t.category] || 'var(--accent)'}">${t.category}</span></td>
-      <td style="font-size:12px;color:var(--text-muted)">${t.card}</td>
+      <td><span class="category-badge" style="background:${color}22;color:${color}">${escapeHtml(t.category)}</span></td>
+      <td style="font-size:12px;color:var(--text-muted)">${escapeHtml(t.card)}</td>
       <td class="amount-cell" style="color:${t.category === 'Income/Credit' ? 'var(--green)' : 'var(--text)'}">
         ${t.category === 'Income/Credit' ? '+' : '-'}${formatMoney(t.amount)}
       </td>
@@ -1558,13 +1637,16 @@ function clearFilters() {
   document.getElementById('filter-from').value = '';
   document.getElementById('filter-to').value = '';
   document.getElementById('filter-search').value = '';
-  setTimeRange('30');
+  setTimeRange('90');
   currentPage = 1;
   renderTable();
 }
 
 function setTimeRange(range) {
   activeTimeRange = range;
+  // Hide custom tab whenever a preset is selected
+  const customBtn = document.getElementById('custom-range-btn');
+  if (customBtn) customBtn.classList.add('hidden');
   document.querySelectorAll('.time-btn').forEach(b => b.classList.toggle('active', b.dataset.range === range));
   if (range === 'all') {
     document.getElementById('filter-from').value = '';
@@ -1576,6 +1658,18 @@ function setTimeRange(range) {
     document.getElementById('filter-from').value = from.toISOString().substring(0, 7);
     document.getElementById('filter-to').value = now.toISOString().substring(0, 7);
   }
+  currentPage = 1;
+  renderDashboard();
+}
+
+function setCustomRange() {
+  // Called when user manually changes a month picker — switch to custom mode
+  activeTimeRange = 'custom';
+  const customBtn = document.getElementById('custom-range-btn');
+  if (customBtn) {
+    customBtn.classList.remove('hidden');
+  }
+  document.querySelectorAll('.time-btn').forEach(b => b.classList.toggle('active', b.dataset.range === 'custom'));
   currentPage = 1;
   renderDashboard();
 }
@@ -1621,7 +1715,7 @@ function renderCharts(charges, monthCount) {
   const monthly = {};
   charges.forEach(t => {
     const m = t.date.substring(0, 7);
-    monthly[m] = (monthly[m] || 0) + t.amount;
+    monthly[m] = roundCents((monthly[m] || 0) + t.amount);
   });
   const monthKeys = Object.keys(monthly).sort();
 
@@ -1631,7 +1725,7 @@ function renderCharts(charges, monthCount) {
   cards.forEach(c => { cardMonthly[c] = {}; });
   charges.forEach(t => {
     const m = t.date.substring(0, 7);
-    cardMonthly[t.card][m] = (cardMonthly[t.card][m] || 0) + t.amount;
+    cardMonthly[t.card][m] = roundCents((cardMonthly[t.card][m] || 0) + t.amount);
   });
 
   const cardColors = ['#38bdf8', '#f472b6', '#fbbf24', '#34d399', '#a78bfa', '#fb923c'];
@@ -1643,7 +1737,7 @@ function renderCharts(charges, monthCount) {
       labels: monthKeys,
       datasets: cards.map((c, i) => ({
         label: c,
-        data: monthKeys.map(m => (cardMonthly[c][m] || 0).toFixed(2)),
+        data: monthKeys.map(m => parseFloat((cardMonthly[c][m] || 0).toFixed(2))),
         backgroundColor: cardColors[i % cardColors.length] + '99',
         borderColor: cardColors[i % cardColors.length],
         borderWidth: 1,
@@ -1662,9 +1756,9 @@ function renderCharts(charges, monthCount) {
 
   // Category breakdown — horizontal bar with amounts visible
   const catTotals = {};
-  charges.forEach(t => { catTotals[t.category] = (catTotals[t.category] || 0) + t.amount; });
+  charges.forEach(t => { catTotals[t.category] = roundCents((catTotals[t.category] || 0) + t.amount); });
   const catEntries = Object.entries(catTotals).sort((a,b) => b[1] - a[1]);
-  const catTotal = catEntries.reduce((s, e) => s + e[1], 0);
+  const catTotal = sumAmounts(catEntries.map(e => e[1]));
 
   if (chartCategory) chartCategory.destroy();
   chartCategory = new Chart(document.getElementById('chart-category'), {
@@ -1675,7 +1769,7 @@ function renderCharts(charges, monthCount) {
         return `${e[0]}  (${pct}%)`;
       }),
       datasets: [{
-        data: catEntries.map(e => e[1].toFixed(2)),
+        data: catEntries.map(e => parseFloat(e[1].toFixed(2))),
         backgroundColor: catEntries.map(e => (CATEGORY_COLORS[e[0]] || '#64748b') + '99'),
         borderColor: catEntries.map(e => CATEGORY_COLORS[e[0]] || '#64748b'),
         borderWidth: 1,
@@ -1727,7 +1821,7 @@ function renderCharts(charges, monthCount) {
     data: {
       labels: catAvgEntries.map(e => e[0]),
       datasets: [{
-        data: catAvgEntries.map(e => e[1].toFixed(2)),
+        data: catAvgEntries.map(e => parseFloat(e[1].toFixed(2))),
         backgroundColor: catAvgEntries.map(e => (CATEGORY_COLORS[e[0]] || '#64748b') + '99'),
         borderColor: catAvgEntries.map(e => CATEGORY_COLORS[e[0]] || '#64748b'),
         borderWidth: 1,
@@ -1770,7 +1864,7 @@ function renderCharts(charges, monthCount) {
   const merchants = {};
   charges.forEach(t => {
     const name = cleanMerchant(t.description);
-    merchants[name] = (merchants[name] || 0) + t.amount;
+    merchants[name] = roundCents((merchants[name] || 0) + t.amount);
   });
   const topMerchants = Object.entries(merchants).sort((a,b) => b[1] - a[1]).slice(0, 10);
 
@@ -1780,7 +1874,7 @@ function renderCharts(charges, monthCount) {
     data: {
       labels: topMerchants.map(e => e[0]),
       datasets: [{
-        data: topMerchants.map(e => e[1].toFixed(2)),
+        data: topMerchants.map(e => parseFloat(e[1].toFixed(2))),
         backgroundColor: '#38bdf822',
         borderColor: '#38bdf8',
         borderWidth: 1,
@@ -1931,20 +2025,24 @@ function openManualEntry() {
 function saveManualEntry() {
   const date = document.getElementById('manual-date').value;
   const desc = document.getElementById('manual-desc').value.trim();
-  const amount = parseFloat(document.getElementById('manual-amount').value);
+  const rawAmount = parseFloat(document.getElementById('manual-amount').value);
+  const amount = roundCents(rawAmount);
   const isCredit = document.getElementById('manual-credit').checked;
   let card = document.getElementById('manual-card').value;
   let category = document.getElementById('manual-category').value;
 
   if (!date) { toast('Enter a date', 'error'); return; }
   if (!desc) { toast('Enter a description', 'error'); return; }
-  if (!amount || amount <= 0) { toast('Enter a valid amount', 'error'); return; }
+  if (!amount || isNaN(amount) || amount <= 0) { toast('Enter a valid amount', 'error'); return; }
 
-  // Handle new card
+  // Handle new card — open modal instead of using prompt()
   if (card === '__new__') {
-    card = prompt('Enter card name:');
-    if (!card || !card.trim()) return;
-    card = card.trim();
+    document.getElementById('new-card-name-input').value = '';
+    document.getElementById('new-card-modal').classList.remove('hidden');
+    setTimeout(() => document.getElementById('new-card-name-input').focus(), 50);
+    // Store pending form state so we can resume after modal confirm
+    window._pendingManualEntry = { date, desc, amount, isCredit, category };
+    return;
   }
 
   // Auto-detect category
@@ -1970,9 +2068,50 @@ function saveManualEntry() {
   toast(`Added: ${desc} — ${formatMoney(amount)}`, 'success');
 }
 
-// ============================================
-// CATEGORY MANAGEMENT
-// ============================================
+function confirmNewCardName() {
+  const name = document.getElementById('new-card-name-input').value.trim();
+  if (!name) { toast('Enter a card name', 'error'); return; }
+  document.getElementById('new-card-modal').classList.add('hidden');
+
+  const p = window._pendingManualEntry;
+  window._pendingManualEntry = null;
+  if (!p) return;
+
+  // Add new card option and select it
+  const cardSel = document.getElementById('manual-card');
+  const opt = document.createElement('option');
+  opt.value = name;
+  opt.textContent = name;
+  cardSel.insertBefore(opt, cardSel.lastElementChild); // before "+ New card..."
+  cardSel.value = name;
+
+  // Finish saving the entry
+  let { date, desc, isCredit, category } = p;
+  const amount = roundCents(p.amount);
+  const card = name;
+
+  if (category === '__auto__') {
+    category = isCredit ? 'Income/Credit' : categorize(desc);
+  }
+  if (isCredit) category = 'Income/Credit';
+
+  const tx = {
+    date,
+    description: desc,
+    amount,
+    isCredit,
+    category,
+    card,
+    id: `${date}_${desc}_${amount}_${Math.random().toString(36).substr(2, 4)}`
+  };
+  transactions.push(tx);
+  saveLocal();
+  document.getElementById('manual-modal').classList.add('hidden');
+  renderDashboard();
+  toast(`Added: ${desc} — ${formatMoney(amount)}`, 'success');
+}
+
+
 let customCategories = {}; // name -> { color, keywords: [] }
 
 function loadCustomCategories() {
@@ -2003,28 +2142,50 @@ function renderCategoryList() {
     const isCustom = customCategories[cat] !== undefined;
     const builtInKws = CATEGORY_RULES[cat] || [];
     const customKws = (customCategories[cat] && customCategories[cat].keywords) || [];
-    // Also include learned rules from customRules
     const learnedKws = Object.entries(customRules).filter(([k, v]) => v === cat).map(([k]) => k);
     const allKws = [...new Set([...customKws, ...learnedKws])];
+    const safeId = cat.replace(/[^a-zA-Z0-9]/g,'_');
     
     return `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:8px;">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:${color};flex-shrink:0"></span>
         <strong style="flex:1;font-size:13px">${escapeHtml(cat)}</strong>
-        ${!builtInKws.length && isCustom ? `<button class="btn btn-sm btn-danger" onclick="deleteCategory('${escapeHtml(cat)}')" style="padding:2px 8px;font-size:11px">Delete</button>` : ''}
+        ${!builtInKws.length && isCustom ? `<button class="btn btn-sm btn-danger" data-action="delete-cat" data-cat="${escapeHtml(cat)}" style="padding:2px 8px;font-size:11px">Delete</button>` : ''}
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
-        ${builtInKws.slice(0, 8).map(k => `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--surface-2);color:var(--text-muted)">${k}</span>`).join('')}
+        ${builtInKws.slice(0, 8).map(k => `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--surface-2);color:var(--text-muted)">${escapeHtml(k)}</span>`).join('')}
         ${builtInKws.length > 8 ? `<span style="font-size:10px;color:var(--text-muted)">+${builtInKws.length - 8} more built-in</span>` : ''}
-        ${allKws.map(k => `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:${color}22;color:${color};cursor:pointer" onclick="removeKeyword('${escapeHtml(cat)}','${escapeHtml(k)}')" title="Click to remove">${k} ✕</span>`).join('')}
+        ${allKws.map(k => `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:${color}22;color:${color};cursor:pointer" data-action="remove-kw" data-cat="${escapeHtml(cat)}" data-kw="${escapeHtml(k)}" title="Click to remove">${escapeHtml(k)} ✕</span>`).join('')}
       </div>
       <div style="display:flex;gap:6px">
-        <input type="text" placeholder="Add keyword..." id="kw-input-${cat.replace(/[^a-zA-Z0-9]/g,'_')}" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-family:var(--font);font-size:12px;"
-          onkeydown="if(event.key==='Enter')addKeyword('${escapeHtml(cat)}')">
-        <button class="btn btn-sm" onclick="addKeyword('${escapeHtml(cat)}')" style="padding:4px 10px;font-size:11px">+ Add</button>
+        <input type="text" placeholder="Add keyword..." id="kw-input-${safeId}" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-family:var(--font);font-size:12px;"
+          data-action-enter="add-kw" data-cat="${escapeHtml(cat)}">
+        <button class="btn btn-sm" data-action="add-kw" data-cat="${escapeHtml(cat)}" style="padding:4px 10px;font-size:11px">+ Add</button>
       </div>
     </div>`;
   }).join('');
+
+  // Attach delegated listener (replace any previous one)
+  el.onclick = null;
+  el.addEventListener('click', _catListClick, { once: false });
+  el.addEventListener('keydown', _catListKeydown, { once: false });
+  // Store ref so we can remove if needed
+  el._listenersAttached = true;
+}
+
+function _catListClick(e) {
+  const action = e.target.dataset.action;
+  if (!action) return;
+  const cat = e.target.dataset.cat;
+  if (action === 'delete-cat') deleteCategory(cat);
+  else if (action === 'remove-kw') removeKeyword(cat, e.target.dataset.kw);
+  else if (action === 'add-kw') addKeyword(cat);
+}
+
+function _catListKeydown(e) {
+  if (e.key !== 'Enter') return;
+  const action = e.target.dataset.actionEnter;
+  if (action === 'add-kw') addKeyword(e.target.dataset.cat);
 }
 
 function addCategory() {
@@ -2134,8 +2295,19 @@ function initCustomCategories() {
 // ============================================
 // UTILS
 // ============================================
+// Round to cents before display to prevent floating-point drift (e.g. 100.00000000002)
+function roundCents(n) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+// Sum an array of amounts accurately via integer-cent accumulation
+function sumAmounts(arr) {
+  const totalCents = arr.reduce((s, v) => s + Math.round((v + Number.EPSILON) * 100), 0);
+  return totalCents / 100;
+}
+
 function formatMoney(n) {
-  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return '$' + roundCents(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function formatDateDisplay(d) {
@@ -2149,7 +2321,8 @@ function formatDateDisplay(d) {
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
-  return div.innerHTML;
+  // Also escape single quotes so inline onclick="...('value')" handlers aren't broken
+  return div.innerHTML.replace(/'/g, '&#39;');
 }
 
 function toast(msg, type = 'success') {
@@ -2173,27 +2346,37 @@ loadConfig();
 loadLocal();
 initCustomCategories();
 
-// Set default 30-day range
-setTimeRange('30');
+// Set default 90-day range
+setTimeRange('90');
 if (transactions.length > 0) renderDashboard();
 
 // Auto-connect on load (NO auto-pull — user must click Pull)
 const cfg = getConfig();
 if (cfg.scriptUrl) {
-  fetch(cfg.scriptUrl)
-    .then(r => r.text())
-    .then(text => {
-      try {
-        const data = JSON.parse(text);
-        if (data.status === 'ok') {
-          document.getElementById('sheets-status').className = 'status-connected';
-          document.getElementById('sheets-status').textContent = '● Connected';
-          if (transactions.length === 0) {
-            toast('Connected — click ↓ Pull to load your data', 'success');
+  // Validate it looks like a Google Apps Script URL before sending a network request
+  let urlOk = false;
+  try { const u = new URL(cfg.scriptUrl); urlOk = u.protocol === 'https:'; } catch(e) {}
+  if (urlOk) {
+    fetch(cfg.scriptUrl, { signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined })
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
+      .then(text => {
+        // Guard: only parse if response looks like JSON (starts with '{')
+        if (!text.trimStart().startsWith('{')) return;
+        try {
+          const data = JSON.parse(text);
+          if (data.status === 'ok') {
+            document.getElementById('sheets-status').className = 'status-connected';
+            document.getElementById('sheets-status').textContent = '● Connected';
+            if (transactions.length === 0) {
+              toast('Connected — click ↓ Pull to load your data', 'success');
+            }
           }
-        }
-      } catch(e) {}
-    }).catch(() => {});
+        } catch(e) {}
+      }).catch(() => {});
+  }
 }
 </script>
 </body>
