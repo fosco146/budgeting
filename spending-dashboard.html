@@ -618,6 +618,18 @@ function doGet(e) {
       <input type="text" id="edit-keyword" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:12px;">
       <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Transactions containing this keyword will auto-categorize</div>
     </div>
+    <div id="edit-amortize-section" style="margin-top:12px;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px">
+        <input type="checkbox" id="edit-amortize" onchange="onAmortizeChange()"> Spread this expense over multiple months
+      </label>
+      <div id="edit-amortize-months-row" style="display:none;align-items:center;gap:8px;margin-top:4px">
+        <span style="font-size:12px;color:var(--text-muted)">Spread over</span>
+        <input type="number" id="edit-amortize-months" min="2" max="24" value="6" oninput="updateAmortizePreview()"
+          style="width:60px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-family:var(--mono);font-size:13px;text-align:center">
+        <span style="font-size:12px;color:var(--text-muted)">months</span>
+        <span id="edit-amortize-preview" style="font-size:12px;color:var(--accent);margin-left:4px"></span>
+      </div>
+    </div>
     <div class="modal-actions">
       <button class="btn btn-danger" onclick="deleteTx()">Delete</button>
       <button class="btn" onclick="closeModal()">Cancel</button>
@@ -1510,7 +1522,27 @@ function renderDashboard() {
   // Charges = spend-only (no credits) for stats and charts
   let charges = allFiltered.filter(t => t.category !== 'Income/Credit');
 
-  const total = sumAmounts(charges.map(t => t.amount));
+  // Determine window bounds for amortization proration
+  let windowStart = null, windowEnd = null;
+  if (activeTimeRange !== 'all' && activeTimeRange !== 'custom') {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - parseInt(activeTimeRange));
+    windowStart = cutoff.toISOString().split('T')[0];
+    windowEnd = new Date().toISOString().split('T')[0];
+  } else if (activeTimeRange === 'custom' && activeCustomStart && activeCustomEnd) {
+    windowStart = activeCustomStart;
+    windowEnd = activeCustomEnd;
+  } else if (activeTimeRange === 'custom') {
+    const from = document.getElementById('filter-from').value;
+    const to = document.getElementById('filter-to').value;
+    if (from) windowStart = from + '-01';
+    if (to) {
+      const [y, m] = to.split('-').map(Number);
+      windowEnd = `${to}-${String(new Date(y, m, 0).getDate()).padStart(2,'0')}`;
+    }
+  }
+
+  const total = sumAmounts(charges.map(t => getEffectiveAmount(t, windowStart, windowEnd)));
 
   // Calculate months spanned.
   // When a fixed time-range button is active (30/60/90/180), use that window
@@ -1536,7 +1568,7 @@ function renderDashboard() {
 
   // Top category
   const catTotals = {};
-  charges.forEach(t => { catTotals[t.category] = roundCents((catTotals[t.category] || 0) + t.amount); });
+  charges.forEach(t => { catTotals[t.category] = roundCents((catTotals[t.category] || 0) + getEffectiveAmount(t, windowStart, windowEnd)); });
   const topCat = Object.entries(catTotals).sort((a,b) => b[1] - a[1])[0];
   if (topCat) {
     document.getElementById('stat-top-cat').textContent = topCat[0];
@@ -1545,7 +1577,7 @@ function renderDashboard() {
 
   // Populate filters
   populateFilters();
-  renderCharts(charges, monthCount);
+  renderCharts(charges, monthCount, windowStart, windowEnd);
   renderTable();
   renderPulse();
 }
@@ -1637,9 +1669,12 @@ function renderTable() {
   tbody.innerHTML = page.map((t) => {
     const realIdx = idxById[t.id] ?? transactions.indexOf(t); // fallback for missing ids
     const color = CATEGORY_COLORS[t.category] || 'var(--accent)';
+    const amortizeBadge = t.amortizeMonths
+      ? `<span title="Spread over ${t.amortizeMonths} months" style="margin-left:6px;font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(167,139,250,0.15);color:var(--purple);font-weight:600">~${t.amortizeMonths}mo</span>`
+      : '';
     return `<tr>
       <td style="font-family:var(--mono);font-size:12px">${formatDateDisplay(t.date)}</td>
-      <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(t.description)}</td>
+      <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(t.description)}${amortizeBadge}</td>
       <td><span class="category-badge" style="background:${color}22;color:${color}">${escapeHtml(t.category)}</span></td>
       <td style="font-size:12px;color:var(--text-muted)">${escapeHtml(t.card)}</td>
       <td class="amount-cell" style="color:${t.category === 'Income/Credit' ? 'var(--green)' : 'var(--text)'}">
@@ -1749,7 +1784,7 @@ function renameCard(oldKey, newName) {
 // ============================================
 // CHARTS
 // ============================================
-function renderCharts(charges, monthCount) {
+function renderCharts(charges, monthCount, windowStart, windowEnd) {
   // 90-day period chart — always built from ALL transactions (not filtered window)
   // so the chart shows full rolling context regardless of active filter
   const allCharges = transactions.filter(t => t.category !== 'Income/Credit');
@@ -1849,7 +1884,7 @@ function renderCharts(charges, monthCount) {
 
   // Category breakdown — horizontal bar with amounts visible
   const catTotals = {};
-  charges.forEach(t => { catTotals[t.category] = roundCents((catTotals[t.category] || 0) + t.amount); });
+  charges.forEach(t => { catTotals[t.category] = roundCents((catTotals[t.category] || 0) + getEffectiveAmount(t, windowStart, windowEnd)); });
   const catEntries = Object.entries(catTotals).sort((a,b) => b[1] - a[1]);
   const catTotal = sumAmounts(catEntries.map(e => e[1]));
 
@@ -1976,7 +2011,7 @@ function renderCharts(charges, monthCount) {
   const merchants = {};
   charges.forEach(t => {
     const name = cleanMerchant(t.description);
-    merchants[name] = roundCents((merchants[name] || 0) + t.amount);
+    merchants[name] = roundCents((merchants[name] || 0) + getEffectiveAmount(t, windowStart, windowEnd));
   });
   const topMerchants = Object.entries(merchants).sort((a,b) => b[1] - a[1]).slice(0, 10);
 
@@ -2070,7 +2105,32 @@ function openEdit(idx) {
   document.getElementById('edit-keyword').value = extractKeyword(t.description);
   document.getElementById('edit-remember').checked = true;
   document.getElementById('edit-remember-section').classList.add('hidden');
+  // Amortization
+  const hasAmortize = !!t.amortizeMonths;
+  document.getElementById('edit-amortize').checked = hasAmortize;
+  document.getElementById('edit-amortize-months').value = t.amortizeMonths || 6;
+  document.getElementById('edit-amortize-months-row').style.display = hasAmortize ? 'flex' : 'none';
+  updateAmortizePreview();
   document.getElementById('edit-modal').classList.remove('hidden');
+}
+
+function onAmortizeChange() {
+  const checked = document.getElementById('edit-amortize').checked;
+  document.getElementById('edit-amortize-months-row').style.display = checked ? 'flex' : 'none';
+  updateAmortizePreview();
+}
+
+function updateAmortizePreview() {
+  if (editingIdx === null) return;
+  const t = transactions[editingIdx];
+  const checked = document.getElementById('edit-amortize').checked;
+  const months = parseInt(document.getElementById('edit-amortize-months').value) || 3;
+  const preview = document.getElementById('edit-amortize-preview');
+  if (checked && t.amount) {
+    preview.textContent = '= ' + formatMoney(roundCents(t.amount / months)) + '/mo';
+  } else {
+    preview.textContent = '';
+  }
 }
 
 function onEditCategoryChange() {
@@ -2114,6 +2174,14 @@ function saveEdit() {
 
   t.category = newCat;
   t.description = newDesc;
+  // Amortization
+  const amortize = document.getElementById('edit-amortize').checked;
+  const months = parseInt(document.getElementById('edit-amortize-months').value) || 3;
+  if (amortize && months >= 2) {
+    t.amortizeMonths = months;
+  } else {
+    delete t.amortizeMonths;
+  }
   saveLocal();
   closeModal();
   renderDashboard();
@@ -2436,6 +2504,28 @@ function sumAmounts(arr) {
   return totalCents / 100;
 }
 
+// Returns the effective amount of a transaction for a given date window.
+// If amortized, returns the prorated portion that falls within [windowStart, windowEnd].
+// windowStart/windowEnd are 'YYYY-MM-DD' strings (or null for unbounded).
+function getEffectiveAmount(t, windowStart, windowEnd) {
+  if (!t.amortizeMonths || t.amortizeMonths < 2) return t.amount;
+  // Amortization window: transaction date through N months
+  const txDate = new Date(t.date + 'T00:00:00');
+  const amortEnd = new Date(txDate);
+  amortEnd.setMonth(amortEnd.getMonth() + t.amortizeMonths);
+  amortEnd.setDate(amortEnd.getDate() - 1); // inclusive end
+  const amortStartStr = t.date;
+  const amortEndStr = amortEnd.toISOString().split('T')[0];
+  // Overlap of [windowStart, windowEnd] with [amortStart, amortEnd]
+  const overlapStart = windowStart ? (windowStart > amortStartStr ? windowStart : amortStartStr) : amortStartStr;
+  const overlapEnd = windowEnd ? (windowEnd < amortEndStr ? windowEnd : amortEndStr) : amortEndStr;
+  if (overlapStart > overlapEnd) return 0;
+  // Days in overlap vs total amortization days
+  const overlapDays = (new Date(overlapEnd) - new Date(overlapStart)) / (1000*60*60*24) + 1;
+  const totalDays = (new Date(amortEndStr) - new Date(amortStartStr)) / (1000*60*60*24) + 1;
+  return roundCents(t.amount * (overlapDays / totalDays));
+}
+
 function formatMoney(n) {
   return '$' + roundCents(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -2567,14 +2657,15 @@ function computePulseData() {
   const baselineMonths = Math.max(1, baselineDays / 30.44);
 
   // Aggregate by category
+  const pulseWindowEnd = new Date().toISOString().split('T')[0];
   const currentByCat = {};
   currentTx.forEach(t => {
-    currentByCat[t.category] = roundCents((currentByCat[t.category] || 0) + t.amount);
+    currentByCat[t.category] = roundCents((currentByCat[t.category] || 0) + getEffectiveAmount(t, cutoffStr, pulseWindowEnd));
   });
 
   const baselineByCat = {};
   baselineTx.forEach(t => {
-    baselineByCat[t.category] = roundCents((baselineByCat[t.category] || 0) + t.amount);
+    baselineByCat[t.category] = roundCents((baselineByCat[t.category] || 0) + getEffectiveAmount(t, baselineDates[0], cutoffStr));
   });
 
   // Build comparison rows for all categories that appear in either window
